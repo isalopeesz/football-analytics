@@ -1,0 +1,17 @@
+# Dados brutos (baixar do Kaggle)
+data/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ambiente virtual
+venv/
+.venv/
+
+# Streamlit
+.streamlit/
+
+# PDF gerado localmente
+*.pdf
