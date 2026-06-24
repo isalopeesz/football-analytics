@@ -41,7 +41,7 @@ def load_raw() -> dict[str, pd.DataFrame]:
 def clean_players(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Tipos
+    # Conversão de tipos
     df["date_of_birth"] = pd.to_datetime(df["date_of_birth"], errors="coerce")
     df["last_season"] = pd.to_numeric(df["last_season"], errors="coerce")
     df["market_value_in_eur"] = pd.to_numeric(df["market_value_in_eur"], errors="coerce")
@@ -52,15 +52,15 @@ def clean_players(df: pd.DataFrame) -> pd.DataFrame:
     # Remove duplicatas pelo ID
     df = df.drop_duplicates(subset="player_id")
 
-    # Cria coluna de idade atual
+    # Idade calculada com NumPy (dias / 365.25)
     hoje = pd.Timestamp("2025-01-01")
-    df["age"] = ((hoje - df["date_of_birth"]).dt.days / 365.25).round(1)
+    df["age"] = np.floor((hoje - df["date_of_birth"]).dt.days / 365.25).astype("Int64")
 
-    # Remove jogadores sem posição ou com idade absurda
+    # Remove jogadores sem posição ou com idade fora do intervalo válido
     df = df.dropna(subset=["position"])
-    df = df[df["age"].between(15, 50, inclusive="both")]
+    df = df[df["age"].between(15, 50)]
 
-    # Simplifica posições para categoria principal
+    # Simplifica posições para 4 grupos
     position_map = {
         "Attack": "Atacante",
         "Midfield": "Meio-Campo",
@@ -69,8 +69,22 @@ def clean_players(df: pd.DataFrame) -> pd.DataFrame:
     }
     df["position_group"] = df["position"].map(position_map).fillna(df["position"])
 
-    # Log do valor de mercado (útil para regressão)
+    # Faixa etária com pd.cut (engenharia de feature categórica)
+    df["age_group"] = pd.cut(
+        df["age"].astype(float),
+        bins=[14, 20, 24, 28, 32, 50],
+        labels=["Sub-21", "21-24", "25-28", "29-32", "33+"],
+    )
+
+    # Log do valor de mercado para análise (NumPy)
     df["log_market_value"] = np.log1p(df["market_value_in_eur"].fillna(0))
+
+    # Proporção entre valor atual e valor histórico máximo
+    df["value_to_peak_ratio"] = np.where(
+        df["highest_market_value_in_eur"] > 0,
+        df["market_value_in_eur"] / df["highest_market_value_in_eur"],
+        np.nan,
+    ).round(3)
 
     return df
 
@@ -86,16 +100,17 @@ def clean_appearances(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["date", "player_id"])
     df = df.drop_duplicates(subset=["appearance_id"])
 
-    # Feature: contribuições diretas (gols + assistências)
+    # Contribuições diretas (Pandas)
     df["goal_contributions"] = df["goals"] + df["assists"]
 
-    # Feature: minutos por contribuição (evita divisão por zero)
+    # Minutos por contribuição — evita divisão por zero (NumPy)
     df["minutes_per_contribution"] = np.where(
         df["goal_contributions"] > 0,
         df["minutes_played"] / df["goal_contributions"],
         np.nan,
     )
 
+    # Temporada derivada da data (julho = início da temporada europeia)
     df["season"] = df["date"].dt.year.where(
         df["date"].dt.month >= 7, df["date"].dt.year - 1
     )
@@ -135,13 +150,51 @@ def build_player_stats(appearances: pd.DataFrame) -> pd.DataFrame:
             total_red=("red_cards", "sum"),
             total_contributions=("goal_contributions", "sum"),
             seasons_active=("season", "nunique"),
+            avg_minutes_per_contribution=("minutes_per_contribution", "mean"),
         )
         .reset_index()
     )
-    agg["goals_per_game"] = (agg["total_goals"] / agg["total_appearances"]).round(3)
-    agg["assists_per_game"] = (agg["total_assists"] / agg["total_appearances"]).round(3)
-    agg["minutes_per_game"] = (agg["total_minutes"] / agg["total_appearances"]).round(1)
+
+    # Métricas por jogo (Pandas + NumPy)
+    agg["goals_per_game"]   = (agg["total_goals"]   / agg["total_appearances"]).round(3)
+    agg["assists_per_game"] = (agg["total_assists"]  / agg["total_appearances"]).round(3)
+    agg["minutes_per_game"] = (agg["total_minutes"]  / agg["total_appearances"]).round(1)
+    agg["red_cards_per_game"] = (agg["total_red"]    / agg["total_appearances"]).round(4)
+
+    # Score de performance ponderado (NumPy): gols valem 2x, assistências 1x, normalizado por jogo
+    agg["performance_score"] = np.round(
+        (agg["total_goals"] * 2 + agg["total_assists"]) / np.maximum(agg["total_appearances"], 1),
+        3,
+    )
+
+    # Quartis de performance com pd.qcut (Pandas)
+    try:
+        agg["performance_tier"] = pd.qcut(
+            agg["performance_score"],
+            q=4,
+            labels=["Bronze", "Prata", "Ouro", "Elite"],
+            duplicates="drop",
+        )
+    except ValueError:
+        agg["performance_tier"] = "Prata"
+
     return agg
+
+
+def detect_value_outliers(master: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detecta outliers de valor de mercado usando o método IQR (NumPy).
+    Adiciona coluna booleana 'is_value_outlier'.
+    """
+    vals = master["latest_market_value"].dropna().values
+    q1 = np.percentile(vals, 25)
+    q3 = np.percentile(vals, 75)
+    iqr = q3 - q1
+    upper = q3 + 1.5 * iqr
+
+    master = master.copy()
+    master["is_value_outlier"] = master["latest_market_value"] > upper
+    return master
 
 
 def build_master(dfs: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -149,11 +202,11 @@ def build_master(dfs: dict[str, pd.DataFrame]) -> pd.DataFrame:
     Constrói DataFrame mestre combinando jogadores, estatísticas agregadas
     e valor de mercado mais recente.
     """
-    players = clean_players(dfs["players"])
+    players  = clean_players(dfs["players"])
     appearances = clean_appearances(dfs["appearances"])
-    valuations = clean_valuations(dfs["player_valuations"])
+    valuations  = clean_valuations(dfs["player_valuations"])
 
-    # Valor de mercado mais recente por jogador
+    # Valor de mercado mais recente por jogador (Pandas groupby + last)
     latest_val = (
         valuations.sort_values("date")
         .groupby("player_id")["market_value_in_eur"]
@@ -165,26 +218,53 @@ def build_master(dfs: dict[str, pd.DataFrame]) -> pd.DataFrame:
     stats = build_player_stats(appearances)
 
     master = (
-        players.merge(stats, on="player_id", how="left")
+        players
+        .merge(stats, on="player_id", how="left")
         .merge(latest_val, on="player_id", how="left")
     )
 
-    master["total_appearances"] = master["total_appearances"].fillna(0)
-    master["total_goals"] = master["total_goals"].fillna(0)
-    master["total_assists"] = master["total_assists"].fillna(0)
+    # Preenche nulos nas colunas numéricas com 0 (Pandas)
+    zero_cols = ["total_appearances", "total_goals", "total_assists",
+                 "total_minutes", "total_contributions"]
+    master[zero_cols] = master[zero_cols].fillna(0)
+
+    # Log do valor de mercado (NumPy)
     master["log_latest_value"] = np.log1p(master["latest_market_value"].fillna(0))
 
+    # Faixa de valor de mercado com pd.cut (Pandas)
+    master["value_tier"] = pd.cut(
+        master["latest_market_value"].fillna(0),
+        bins=[0, 1_000_000, 10_000_000, 50_000_000, np.inf],
+        labels=["< €1M", "€1M–€10M", "€10M–€50M", "> €50M"],
+    )
+
+    # Detecta outliers de valor (NumPy IQR)
+    master = detect_value_outliers(master)
+
     return master
+
+
+def get_correlation_matrix(master: pd.DataFrame) -> pd.DataFrame:
+    """Retorna matriz de correlação entre as principais variáveis numéricas."""
+    cols = [
+        "age", "total_appearances", "total_goals", "total_assists",
+        "goals_per_game", "assists_per_game", "minutes_per_game",
+        "performance_score", "seasons_active", "latest_market_value",
+    ]
+    available = [c for c in cols if c in master.columns]
+    return master[available].corr(numeric_only=True).round(2)
 
 
 def load_all() -> dict[str, pd.DataFrame]:
     """Ponto de entrada principal: retorna dict com todos os DataFrames limpos."""
     raw = load_raw()
+    master = build_master(raw)
     return {
-        "master": build_master(raw),
+        "master": master,
         "appearances": clean_appearances(raw["appearances"]),
         "valuations": clean_valuations(raw["player_valuations"]),
         "games": clean_games(raw["games"]),
         "clubs": raw["clubs"],
         "competitions": raw["competitions"],
+        "corr_matrix": get_correlation_matrix(master),
     }

@@ -1,0 +1,24 @@
+{
+  "name": "football-analysis",
+  "version": "1.0.0",
+  "description": "",
+  "main": "gerar_relatorio_abnt.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/isalopeesz/football-analytics.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/isalopeesz/football-analytics/issues"
+  },
+  "homepage": "https://github.com/isalopeesz/football-analytics#readme",
+  "dependencies": {
+    "docx": "^9.7.1"
+  }
+}
